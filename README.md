@@ -4,6 +4,8 @@
 
 Watch a SAT solver think.
 
+[![SATGlow demo video](https://img.youtube.com/vi/gsQ104doWps/maxresdefault.jpg)](https://www.youtube.com/watch?v=gsQ104doWps)
+
 SATGlow runs a real CDCL solver (CaDiCaL, Kissat or MiniSat) on a DIMACS CNF
 file and draws its state with OpenGL while it runs: which variables are
 assigned, which were decisions, where conflicts happen, and how the trail
