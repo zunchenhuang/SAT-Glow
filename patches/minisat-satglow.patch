@@ -1,0 +1,205 @@
+--- a/minisat/core/Solver.cc	2026-11-14 09:04:17.150487629 +0000
++++ b/minisat/core/Solver.cc	2026-11-14 09:04:17.214009704 +0000
+@@ -25,6 +25,9 @@
+ #include "minisat/utils/System.h"
+ #include "minisat/core/Solver.h"
+ 
++// satglow: visualization hooks (see sg_hooks.h).
++#include "sg_hooks.h"
++
+ using namespace Minisat;
+ 
+ //=================================================================================================
+@@ -233,12 +236,14 @@
+         for (int c = trail.size()-1; c >= trail_lim[level]; c--){
+             Var      x  = var(trail[c]);
+             assigns [x] = l_Undef;
++            sg_unassign(x + 1); // satglow
+             if (phase_saving > 1 || (phase_saving == 1 && c > trail_lim.last()))
+                 polarity[x] = sign(trail[c]);
+             insertVarOrder(x); }
+         qhead = trail_lim[level];
+         trail.shrink(trail.size() - trail_lim[level]);
+         trail_lim.shrink(trail_lim.size() - level);
++        sg_backtrack(level); // satglow
+     } }
+ 
+ 
+@@ -489,6 +494,8 @@
+     assigns[var(p)] = lbool(!sign(p));
+     vardata[var(p)] = mkVarData(from, decisionLevel());
+     trail.push_(p);
++    sg_assign(sign(p) ? -(var(p) + 1) : var(p) + 1, decisionLevel(),
++              from == CRef_Undef && decisionLevel() > 0 ? SG_KIND_DECISION : SG_KIND_PROPAGATED); // satglow
+ }
+ 
+ 
+@@ -580,6 +587,7 @@
+ };
+ void Solver::reduceDB()
+ {
++    sg_reduce(); // satglow
+     int     i, j;
+     double  extra_lim = cla_inc / learnts.size();    // Remove any clause below this activity
+ 
+@@ -712,10 +720,24 @@
+         if (confl != CRef_Undef){
+             // CONFLICT
+             conflicts++; conflictC++;
++            sg_conflict(); // satglow
+             if (decisionLevel() == 0) return l_False;
+ 
+             learnt_clause.clear();
+             analyze(confl, learnt_clause, backtrack_level);
++            { // satglow: report the learned clause, its glue and the backjump
++                vec<int> sg_levels;
++                for (int i = 0; i < learnt_clause.size(); i++)
++                    sg_levels.push(level(var(learnt_clause[i])));
++                sort(sg_levels);
++                int sg_glue = 0;
++                for (int i = 0; i < sg_levels.size(); i++)
++                    if (i == 0 || sg_levels[i] != sg_levels[i-1]) sg_glue++;
++                sg_learned(learnt_clause.size(), sg_glue);
++                for (int i = 0; i < learnt_clause.size(); i++)
++                    sg_learned_lit(sign(learnt_clause[i]) ? -(var(learnt_clause[i]) + 1) : var(learnt_clause[i]) + 1);
++                sg_backjump(decisionLevel(), backtrack_level);
++            }
+             cancelUntil(backtrack_level);
+ 
+             if (learnt_clause.size() == 1){
+@@ -748,6 +770,7 @@
+             if ((nof_conflicts >= 0 && conflictC >= nof_conflicts) || !withinBudget()){
+                 // Reached bound on number of conflicts:
+                 progress_estimate = progressEstimate();
++                sg_restart(); // satglow
+                 cancelUntil(0);
+                 return l_Undef; }
+ 
+--- a/minisat/core/Solver.h	2026-11-14 09:04:17.150512579 +0000
++++ b/minisat/core/Solver.h	2026-11-14 09:04:17.214791017 +0000
+@@ -368,11 +368,11 @@
+ }
+ inline void     Solver::setConfBudget(int64_t x){ conflict_budget    = conflicts    + x; }
+ inline void     Solver::setPropBudget(int64_t x){ propagation_budget = propagations + x; }
+-inline void     Solver::interrupt(){ asynch_interrupt = true; }
++inline void     Solver::interrupt(){ __atomic_store_n(&asynch_interrupt, true, __ATOMIC_RELAXED); } // satglow: called from the render thread
+ inline void     Solver::clearInterrupt(){ asynch_interrupt = false; }
+ inline void     Solver::budgetOff(){ conflict_budget = propagation_budget = -1; }
+ inline bool     Solver::withinBudget() const {
+-    return !asynch_interrupt &&
++    return !__atomic_load_n(&asynch_interrupt, __ATOMIC_RELAXED) &&
+            (conflict_budget    < 0 || conflicts < (uint64_t)conflict_budget) &&
+            (propagation_budget < 0 || propagations < (uint64_t)propagation_budget); }
+ 
+--- a/minisat/core/SolverTypes.h	2026-11-14 09:04:17.150534754 +0000
++++ b/minisat/core/SolverTypes.h	2026-11-14 09:04:31.923530895 +0000
+@@ -52,7 +52,7 @@
+     int     x;
+ 
+     // Use this as a constructor:
+-    friend Lit mkLit(Var var, bool sign = false);
++    friend Lit mkLit(Var var, bool sign); // satglow: default argument moved to the definition
+ 
+     bool operator == (Lit p) const { return x == p.x; }
+     bool operator != (Lit p) const { return x != p.x; }
+@@ -60,7 +60,7 @@
+ };
+ 
+ 
+-inline  Lit  mkLit     (Var var, bool sign) { Lit p; p.x = var + var + (int)sign; return p; }
++inline  Lit  mkLit     (Var var, bool sign = false) { Lit p; p.x = var + var + (int)sign; return p; }
+ inline  Lit  operator ~(Lit p)              { Lit q; q.x = p.x ^ 1; return q; }
+ inline  Lit  operator ^(Lit p, bool b)      { Lit q; q.x = p.x ^ (unsigned int)b; return q; }
+ inline  bool sign      (Lit p)              { return p.x & 1; }
+--- a/minisat/simp/SimpSolver.cc	2026-11-14 09:04:17.150915328 +0000
++++ b/minisat/simp/SimpSolver.cc	2026-11-14 09:04:17.215127790 +0000
+@@ -22,6 +22,9 @@
+ #include "minisat/simp/SimpSolver.h"
+ #include "minisat/utils/System.h"
+ 
++// satglow: visualization hooks (see sg_hooks.h).
++#include "sg_hooks.h"
++
+ using namespace Minisat;
+ 
+ //=================================================================================================
+@@ -348,7 +351,7 @@
+     while (subsumption_queue.size() > 0 || bwdsub_assigns < trail.size()){
+ 
+         // Empty subsumption queue and return immediately on user-interrupt:
+-        if (asynch_interrupt){
++        if (__atomic_load_n(&asynch_interrupt, __ATOMIC_RELAXED)){
+             subsumption_queue.clear();
+             bwdsub_assigns = trail.size();
+             break; }
+@@ -509,6 +512,7 @@
+ 
+     // Delete and store old clauses:
+     eliminated[v] = true;
++    sg_gone(v + 1, 1); // satglow
+     setDecisionVar(v, false);
+     eliminated_vars++;
+ 
+@@ -552,6 +556,7 @@
+     if (!ok) return false;
+ 
+     eliminated[v] = true;
++    sg_gone(v + 1, 1); // satglow
+     setDecisionVar(v, false);
+     const vec<CRef>& cls = occurs.lookup(v);
+     
+@@ -610,7 +615,7 @@
+             ok = false; goto cleanup; }
+ 
+         // Empty elim_heap and return immediately on user-interrupt:
+-        if (asynch_interrupt){
++        if (__atomic_load_n(&asynch_interrupt, __ATOMIC_RELAXED)){
+             assert(bwdsub_assigns == trail.size());
+             assert(subsumption_queue.size() == 0);
+             assert(n_touched == 0);
+@@ -621,7 +626,7 @@
+         for (int cnt = 0; !elim_heap.empty(); cnt++){
+             Var elim = elim_heap.removeMin();
+             
+-            if (asynch_interrupt) break;
++            if (__atomic_load_n(&asynch_interrupt, __ATOMIC_RELAXED)) break;
+ 
+             if (isEliminated(elim) || value(elim) != l_Undef) continue;
+ 
+--- a/minisat/utils/ParseUtils.h	2026-11-14 09:04:17.151080417 +0000
++++ b/minisat/utils/ParseUtils.h	2026-11-14 09:04:42.669095520 +0000
+@@ -24,7 +24,9 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ 
++#ifndef MINISAT_NO_ZLIB // satglow: the DIMACS reader is not used
+ #include <zlib.h>
++#endif
+ 
+ #include "minisat/mtl/XAlloc.h"
+ 
+@@ -35,6 +37,7 @@
+ 
+ 
+ 
++#ifndef MINISAT_NO_ZLIB
+ class StreamBuffer {
+     gzFile         in;
+     unsigned char* buf;
+@@ -59,13 +62,16 @@
+     void operator ++ ()       { pos++; assureLookahead(); }
+     int  position    () const { return pos; }
+ };
++#endif
+ 
+ 
+ //-------------------------------------------------------------------------------------------------
+ // End-of-file detection functions for StreamBuffer and char*:
+ 
+ 
++#ifndef MINISAT_NO_ZLIB
+ static inline bool isEof(StreamBuffer& in) { return *in == EOF;  }
++#endif
+ static inline bool isEof(const char*   in) { return *in == '\0'; }
+ 
+ //-------------------------------------------------------------------------------------------------

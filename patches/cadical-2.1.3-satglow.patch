@@ -1,0 +1,224 @@
+diff -ruN a/src/analyze.cpp b/src/analyze.cpp
+--- a/src/analyze.cpp	2026-11-13 20:42:07.386412398 +0000
++++ b/src/analyze.cpp	2026-11-13 21:21:02.547230630 +0000
+@@ -1054,6 +1054,7 @@
+         ++stats.otfs.subsumed;
+         ++stats.subsumed;
+         ++stats.conflicts;
++        sg_conflict (); // satglow
+       }
+ 
+       LOG (reason, "changing conflict to");
+@@ -1178,11 +1179,15 @@
+   // flipped 1st UIP literal.
+   //
+   int jump;
++  sg_learned ((int) clause.size (), glue); // satglow
++  for (const auto &sg_lit : clause)
++    sg_learned_lit (externalize (sg_lit));
+   Clause *driving_clause = new_driving_clause (glue, jump);
+   UPDATE_AVERAGE (averages.current.jump, jump);
+ 
+   int new_level = determine_actual_backtrack_level (jump);
+   UPDATE_AVERAGE (averages.current.level, new_level);
++  sg_backjump (level, new_level); // satglow
+   backtrack (new_level);
+ 
+   // It should hold that (!level <=> size == 1)
+diff -ruN a/src/backtrack.cpp b/src/backtrack.cpp
+--- a/src/backtrack.cpp	2026-11-13 20:42:07.386943694 +0000
++++ b/src/backtrack.cpp	2026-11-13 20:43:10.794165169 +0000
+@@ -10,6 +10,7 @@
+ inline void Internal::unassign (int lit) {
+   assert (val (lit) > 0);
+   set_val (lit, 0);
++  sg_unassign (externalize (lit)); // satglow
+ 
+   int idx = vidx (lit);
+   LOG ("unassign %d @ %d", lit, var (idx).level);
+@@ -153,6 +154,7 @@
+ 
+   control.resize (new_level + 1);
+   level = new_level;
++  sg_backtrack (new_level); // satglow
+   if (tainted_literal) {
+     assert (opts.ilb);
+     if (!val (tainted_literal)) {
+diff -ruN a/src/cadical.hpp b/src/cadical.hpp
+--- a/src/cadical.hpp	2026-11-13 20:42:07.387515123 +0000
++++ b/src/cadical.hpp	2026-11-15 10:00:11.718916273 +0000
+@@ -685,6 +685,8 @@
+   int active () const;          // Number of active variables.
+   int64_t redundant () const;   // Number of active redundant clauses.
+   int64_t irredundant () const; // Number of active irredundant clauses.
++  // satglow: the solver's own conflict and decision counters.
++  void satglow_counts (int64_t &conflicts, int64_t &decisions) const;
+ 
+   //------------------------------------------------------------------------
+   // This function executes the given number of preprocessing rounds. It is
+diff -ruN a/src/clause.cpp b/src/clause.cpp
+--- a/src/clause.cpp	2026-11-13 20:42:07.387956065 +0000
++++ b/src/clause.cpp	2026-11-13 20:43:10.793394066 +0000
+@@ -337,6 +337,7 @@
+   set_val (idx, tmp);
+   trail.push_back (lit);
+   num_assigned++;
++  sg_assign (externalize (lit), 0, SG_KIND_PROPAGATED); // satglow
+   const unsigned uidx = vlit (lit);
+   if (lrat || frat)
+     unit_clauses (uidx) = id;
+diff -ruN a/src/flags.cpp b/src/flags.cpp
+--- a/src/flags.cpp	2026-11-13 20:42:07.390316364 +0000
++++ b/src/flags.cpp	2026-11-13 20:57:20.614785855 +0000
+@@ -33,6 +33,7 @@
+   Flags &f = flags (lit);
+   assert (f.status == Flags::ACTIVE);
+   f.status = Flags::ELIMINATED;
++  sg_gone (externalize (lit), 1); // satglow
+   LOG ("eliminated %d", abs (lit));
+   stats.all.eliminated++;
+   stats.now.eliminated++;
+@@ -47,6 +48,7 @@
+   Flags &f = flags (lit);
+   assert (f.status == Flags::ACTIVE);
+   f.status = Flags::PURE;
++  sg_gone (externalize (lit), 1); // satglow
+   LOG ("pure %d", abs (lit));
+   stats.all.pure++;
+   stats.now.pure++;
+@@ -61,6 +63,7 @@
+   Flags &f = flags (lit);
+   assert (f.status == Flags::ACTIVE);
+   f.status = Flags::SUBSTITUTED;
++  sg_gone (externalize (lit), 1); // satglow
+   LOG ("substituted %d", abs (lit));
+   stats.all.substituted++;
+   stats.now.substituted++;
+@@ -122,6 +125,7 @@
+   LOG ("reactivate previously %s %d", msg, abs (lit));
+ #endif
+   f.status = Flags::ACTIVE;
++  sg_gone (externalize (lit), 0); // satglow
+   assert (active (lit));
+   stats.reactivated++;
+   assert (stats.inactive > 0);
+diff -ruN a/src/instantiate.cpp b/src/instantiate.cpp
+--- a/src/instantiate.cpp	2026-11-13 20:42:07.391097111 +0000
++++ b/src/instantiate.cpp	2026-11-13 20:43:10.793813421 +0000
+@@ -68,6 +68,7 @@
+   num_assigned++;
+   set_val (lit, 1);
+   trail.push_back (lit);
++  sg_assign (externalize (lit), level, SG_KIND_INPROCESS); // satglow
+ }
+ 
+ // Conflict analysis is only needed to do valid resolution proofs.
+@@ -245,6 +246,7 @@
+     assert (val (other) > 0);
+     num_assigned--;
+     set_val (other, 0);
++    sg_unassign (externalize (other)); // satglow
+     // this is a variant of conflict analysis which is only needed for lrat
+     if (!ok && inst_chain.size () && lrat) {
+       Flags &f = flags (other);
+diff -ruN a/src/internal.hpp b/src/internal.hpp
+--- a/src/internal.hpp	2026-11-13 20:42:07.391376011 +0000
++++ b/src/internal.hpp	2026-11-13 20:43:10.791693435 +0000
+@@ -7,6 +7,9 @@
+ 
+ #include "inttypes.hpp"
+ 
++// satglow: visualization hooks (see sg_hooks.h).
++#include "sg_hooks.h"
++
+ /*------------------------------------------------------------------------*/
+ 
+ // Common 'C' headers.
+diff -ruN a/src/probe.cpp b/src/probe.cpp
+--- a/src/probe.cpp	2026-11-13 20:42:07.393916470 +0000
++++ b/src/probe.cpp	2026-11-13 20:43:10.792884232 +0000
+@@ -313,6 +313,7 @@
+   assert (val (lit) > 0);
+   assert (val (-lit) < 0);
+   trail.push_back (lit);
++  sg_assign (externalize (lit), level, SG_KIND_INPROCESS); // satglow
+ 
+   // Do not save the current phase during inprocessing but remember the
+   // number of units on the trail of the last time this literal was
+diff -ruN a/src/propagate.cpp b/src/propagate.cpp
+--- a/src/propagate.cpp	2026-11-13 20:42:07.394278630 +0000
++++ b/src/propagate.cpp	2026-11-13 20:43:10.792624737 +0000
+@@ -107,6 +107,7 @@
+ 
+   const int idx = vidx (lit);
+   const bool from_external = reason == external_reason;
++  const bool sg_decision = reason == decision_reason; // satglow
+   assert (!val (idx));
+   assert (!flags (idx).eliminated () || reason == decision_reason ||
+           reason == external_reason);
+@@ -151,6 +152,8 @@
+   if (!searching_lucky_phases)
+     phases.saved[idx] = tmp; // phase saving during search
+   trail.push_back (lit);
++  sg_assign (externalize (lit), lit_level,
++             sg_decision ? SG_KIND_DECISION : SG_KIND_PROPAGATED); // satglow
+ #ifdef LOGGING
+   if (!lit_level)
+     LOG ("root-level unit assign %d @ 0", lit);
+@@ -468,6 +471,7 @@
+       if (stable)
+         stats.stabconflicts++;
+       stats.conflicts++;
++      sg_conflict (); // satglow
+ 
+       LOG (conflict, "conflict");
+ 
+diff -ruN a/src/reduce.cpp b/src/reduce.cpp
+--- a/src/reduce.cpp	2026-11-13 20:42:07.394947219 +0000
++++ b/src/reduce.cpp	2026-11-13 20:43:10.795001704 +0000
+@@ -191,6 +191,7 @@
+ 
+ void Internal::reduce () {
+   START (reduce);
++  sg_reduce (); // satglow
+ 
+   stats.reductions++;
+   report ('.', 1);
+diff -ruN a/src/restart.cpp b/src/restart.cpp
+--- a/src/restart.cpp	2026-11-13 20:42:07.395324529 +0000
++++ b/src/restart.cpp	2026-11-13 20:43:10.794825943 +0000
+@@ -121,6 +121,7 @@
+ void Internal::restart () {
+   START (restart);
+   stats.restarts++;
++  sg_restart (); // satglow
+   stats.restartlevels += level;
+   if (stable)
+     stats.restartstable++;
+diff -ruN a/src/satglow.cpp b/src/satglow.cpp
+--- a/src/satglow.cpp	1970-01-01 00:00:00.000000000 +0000
++++ b/src/satglow.cpp	2026-11-15 10:00:11.722939004 +0000
+@@ -0,0 +1,12 @@
++// satglow: read access to two of CaDiCaL's own statistics, used to check
++// that the visualization hooks do not change the search.
++#include "internal.hpp"
++
++namespace CaDiCaL {
++
++void Solver::satglow_counts (int64_t &conflicts, int64_t &decisions) const {
++  conflicts = internal->stats.conflicts;
++  decisions = internal->stats.decisions;
++}
++
++} // namespace CaDiCaL
+diff -ruN a/src/vivify.cpp b/src/vivify.cpp
+--- a/src/vivify.cpp	2026-11-13 20:42:07.397589471 +0000
++++ b/src/vivify.cpp	2026-11-13 20:43:10.793144124 +0000
+@@ -64,6 +64,7 @@
+   const signed char tmp = sign (lit);
+   set_val (idx, tmp);
+   trail.push_back (lit);
++  sg_assign (externalize (lit), level, SG_KIND_INPROCESS); // satglow
+   LOG (reason, "vivify assign %d", lit);
+ }
+ 
